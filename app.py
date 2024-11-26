@@ -297,6 +297,24 @@ def update_order_status(order_id):
         db.session.rollback()
         return jsonify({"message": f"Error: {str(e)}"}), 500
 
+#Route pour annuler une commande
+@app.route('/orders/<int:id>/cancel', methods=['PUT'])
+def cancel_order(id):
+    order = Order.query.get(id)
+
+    if not order:
+        return jsonify({"msg": "Order not found"}), 404
+
+    # Vérifie si la commande est déjà annulée
+    if order.status == 'cancelled':
+        return jsonify({"msg": "Order is already cancelled"}), 400
+
+    # Annuler la commande
+    order.status = 'cancelled'
+    db.session.commit()  # Enregistrer les changements dans la base de données
+
+    return jsonify({"msg": "Order has been cancelled", "order_id": order.id}), 200
+
 
 # Lancer l'application Flask
 if __name__ == '__main__':
