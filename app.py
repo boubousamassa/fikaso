@@ -1,10 +1,9 @@
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
-from flask import request, jsonify
-from flask_jwt_extended import jwt_required, get_jwt_identity
-from models import Order
-from extensions import db
+from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity, create_access_token
+from flask_migrate import Migrate
+from flask import Flask, request, jsonify
+from models import db, Trip, MenuItem , Restaurant
 
 # Initialisation de l'application Flask
 app = Flask(__name__)
@@ -14,9 +13,10 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///fikaso.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = 'secret_key'  # Change ceci pour la production
 
-# Initialisation de la base de données et de JWT
+# Initialisation de la base de données, JWT et Flask-Migrate
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
+migrate = Migrate(app, db)
 
 # Modèles de la base de données
 
@@ -24,14 +24,20 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(100), unique=True, nullable=False)
     password = db.Column(db.String(100), nullable=False)
+    address = db.Column(db.String(255))
 
 class Restaurant(db.Model):
+    __tablename__ = 'restaurant'
+
     id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(100), nullable=False)
-    address = db.Column(db.String(100), nullable=False)
-    owner_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    owner = db.relationship('User', backref=db.backref('restaurants', lazy=True))
-    meals = db.relationship('Meal', backref='restaurant', lazy=True)
+    name = db.Column(db.String, nullable=False)
+    address = db.Column(db.String, nullable=False)
+    owner_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)  # ID du propriétaire
+
+    # Colonnes pour les plats
+    dish_name = db.Column(db.String, nullable=False)
+    dish_price = db.Column(db.Float, nullable=False)
+
 
 class Meal(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -47,6 +53,8 @@ class Order(db.Model):
     status = db.Column(db.String(100), default='Pending')  # Pending, Delivered, etc.
     user = db.relationship('User', backref=db.backref('orders', lazy=True))
     meal = db.relationship('Meal', backref=db.backref('orders', lazy=True))
+
+
 
 # Crée les tables si elles n'existent pas déjà
 with app.app_context():
@@ -76,13 +84,21 @@ def login():
     data = request.get_json()
     username = data['username']
     password = data['password']
-
     user = User.query.filter_by(username=username).first()
     if user and user.password == password:
         access_token = create_access_token(identity=user.id)
         return jsonify({'access_token': access_token}), 200
 
     return jsonify({'message': 'Invalid credentials'}), 401
+
+@app.route('/user/<int:user_id>', methods=['GET'])
+def get_user(user_id):
+    user = User.query.get(user_id)
+    if user is None:
+        return jsonify({"error": "User not found"}), 404
+    return jsonify({"id": user.id, "username": user.username})
+
+
 
 
 # Passer une commande
@@ -108,51 +124,41 @@ def get_orders():
     return jsonify([{'id': o.id, 'meal': o.meal.name, 'status': o.status} for o in orders])
 
 #Cette route permet à un utilisateur authentifié d'ajouter un restaurant.
-@app.route('/restaurants', methods=['POST'])
-@jwt_required()
-def add_restaurant():
-    current_user_id = get_jwt_identity()  # ID de l'utilisateur authentifié
+@app.route('/create_restaurant', methods=['POST'])
+def create_restaurant():
     data = request.get_json()
 
-    name = data.get('name')
-    address = data.get('address')
-
-    if not name or not address:
-        return jsonify({'message': 'Missing name or address'}), 400
-
-    # Créer un restaurant
-    new_restaurant = Restaurant(name=name, address=address, owner_id=current_user_id)
-
     try:
-        db.session.add(new_restaurant)
+        # Assurez-vous que les champs requis sont dans la requête
+        restaurant = Restaurant(
+            name=data['name'],
+            address=data['address'],
+            owner_id=data['owner_id'],
+            dish_name=data.get('dish_name', ''),  # Utilisation de get pour éviter l'erreur si 'dish_name' est manquant
+            dish_price=data.get('dish_price', 0.0)  # Utilisation de get pour éviter l'erreur si 'dish_price' est manquant
+        )
+
+        db.session.add(restaurant)
         db.session.commit()
-        return jsonify({'message': 'Restaurant added successfully'}), 201
+
+        return jsonify({"message": "Restaurant created successfully", "restaurant": data}), 201
+    except KeyError as e:
+        return jsonify({"error": f"Missing parameter: {str(e)}"}), 400
     except Exception as e:
-        db.session.rollback()
-        return jsonify({'message': f'Error: {str(e)}'}), 500
+        return jsonify({"error": str(e)}), 500
 
-#Cette route permet de lister tous les restaurants de l'utilisateur authentifié.
 @app.route('/restaurants', methods=['GET'])
-@jwt_required()
 def get_restaurants():
-    current_user_id = get_jwt_identity()
-
-    # Récupérer tous les restaurants de l'utilisateur
-    restaurants = Restaurant.query.filter_by(owner_id=current_user_id).all()
-
-    if not restaurants:
-        return jsonify({'message': 'No restaurants found'}), 404
-
-    # Formater la réponse
-    restaurants_list = []
+    restaurants = Restaurant.query.all()
+    restaurants_data = []
     for restaurant in restaurants:
-        restaurants_list.append({
-            'id': restaurant.id,
+        menu_items = [{'name': item.name, 'price': item.price} for item in restaurant.menu_items]
+        restaurants_data.append({
             'name': restaurant.name,
-            'address': restaurant.address
+            'address': restaurant.address,
+            'menu': menu_items
         })
-
-    return jsonify(restaurants_list), 200
+    return jsonify(restaurants_data)
 
 #Cette route permet d'ajouter un repas à un restaurant.
 @app.route('/restaurants/<int:restaurant_id>/meals', methods=['POST'])
@@ -312,8 +318,80 @@ def cancel_order(id):
     # Annuler la commande
     order.status = 'cancelled'
     db.session.commit()  # Enregistrer les changements dans la base de données
-
     return jsonify({"msg": "Order has been cancelled", "order_id": order.id}), 200
+
+#Ajoute une route pour mettre à jour l'adresse de l'utilisateur
+@app.route('/users/address', methods=['PUT'])
+@jwt_required()
+def update_address():
+    current_user_id = get_jwt_identity()
+    data = request.get_json()
+
+    latitude = data.get('latitude')
+    longitude = data.get('longitude')
+    address = data.get('address')  # Adresse optionnelle générée sur le front-end
+
+    if not all([latitude, longitude]):
+        return jsonify({"message": "Latitude and longitude are required"}), 400
+
+    user = User.query.get(current_user_id)
+    if not user:
+        return jsonify({"message": "User not found"}), 404
+
+    # Mettre à jour l'adresse de l'utilisateur
+    user.address = address
+    try:
+        db.session.commit()
+        return jsonify({"message": "Address updated successfully"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"message": f"Error: {str(e)}"}), 500
+
+#Les routes pour gérer les trajets (demander un trajet, assigner un conducteur, etc.)
+@app.route('/request_trip', methods=['POST'])
+def request_trip():
+    data = request.get_json()
+    origin = data.get('origin')
+    destination = data.get('destination')
+    user_id = data.get('user_id')
+
+    new_trip = Trip(user_id=user_id, origin=origin, destination=destination)
+    db.session.add(new_trip)
+    db.session.commit()
+
+    return jsonify({"msg": "Trip requested", "trip_id": new_trip.id}), 201
+
+
+#Route pour assigner un conducteur à un trajet
+@app.route('/assign_driver/<int:trip_id>', methods=['PUT'])
+def assign_driver(trip_id):
+    data = request.get_json()
+    driver_id = data.get('driver_id')
+
+    trip = Trip.query.get(trip_id)
+    if not trip:
+        return jsonify({"msg": "Trip not found"}), 404
+
+    trip.driver_id = driver_id
+    trip.status = 'in_progress'
+    db.session.commit()
+
+    return jsonify({"msg": "Driver assigned", "trip_id": trip.id, "status": trip.status})
+
+#Route pour mettre à jour l'état du trajet
+@app.route('/update_trip_status/<int:trip_id>', methods=['PUT'])
+def update_trip_status(trip_id):
+    data = request.get_json()
+    status = data.get('status')
+
+    trip = Trip.query.get(trip_id)
+    if not trip:
+        return jsonify({"msg": "Trip not found"}), 404
+
+    trip.status = status
+    db.session.commit()
+
+    return jsonify({"msg": "Trip status updated", "trip_id": trip.id, "status": trip.status})
 
 
 # Lancer l'application Flask
