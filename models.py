@@ -1,5 +1,6 @@
 from datetime import datetime
 from extensions import db
+import json
 
 
 # Modèle pour l'utilisateur
@@ -21,43 +22,33 @@ class Restaurant(db.Model):
     name = db.Column(db.String, nullable=False)
     address = db.Column(db.String, nullable=False)
     owner_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)  # ID du propriétaire
+    owner = db.relationship('User', backref=db.backref('restaurants', lazy=True))
+
+    # Relation avec les plats
+    menu_items = db.relationship('MenuItem', backref='restaurant', lazy=True)
 
 
-    # Colonnes pour les plats
-    dish_name = db.Column(db.String, nullable=False)
-    dish_price = db.Column(db.Float, nullable=False)
-
-
-
-# Modèle pour les articles de menu (MenuItem)
 class MenuItem(db.Model):
     __tablename__ = 'menu_item'
 
     id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String, nullable=False)
-    price = db.Column(db.Float, nullable=False)
-    restaurant_id = db.Column(db.Integer, db.ForeignKey('restaurant.id'), nullable=False)
-
-    # Relation avec le restaurant
-    restaurant = db.relationship('Restaurant', back_populates='menu_items')
-
-    def __repr__(self):
-        return f"<MenuItem {self.name} - {self.price}>"
-
+    name = db.Column(db.String, nullable=False)  # Nom du plat
+    price = db.Column(db.Float, nullable=False)  # Prix du plat
+    restaurant_id = db.Column(db.Integer, db.ForeignKey('restaurant.id'), nullable=False)  # ID du restaurant
 
 # Modèle pour les commandes
 class Order(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)  # L'utilisateur qui passe la commande
-    restaurant_id = db.Column(db.Integer, db.ForeignKey('restaurant.id'), nullable=False)
-    delivery_address = db.Column(db.String(255), nullable=False)
-    items = db.Column(db.Text, nullable=False)  # JSON des articles commandés
-    total_price = db.Column(db.Float, nullable=False)
-    status = db.Column(db.String(50), default="Pending")  # Pending, In Progress, Delivered, Cancelled
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    __tablename__ = 'orders'
 
-    def __repr__(self):
-        return f"<Order {self.id} - Status: {self.status}>"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    restaurant_id = db.Column(db.Integer, db.ForeignKey('restaurant.id'), nullable=False)
+    delivery_address = db.Column(db.String, nullable=False)
+    items = db.Column(db.Text, nullable=False)  # Stocké comme JSON string
+    total_price = db.Column(db.Float, nullable=False)
+
+    def get_items(self):
+        return json.loads(self.items)  # Convertir la chaîne JSON en liste Python
 
 
 # Modèle pour les conducteurs (ajouté)
