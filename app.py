@@ -1,4 +1,3 @@
-from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity, create_access_token
 from flask_migrate import Migrate
@@ -6,6 +5,7 @@ from flask import Flask, request, jsonify
 from models import db, Trip, MenuItem , Restaurant
 import json
 from flask_jwt_extended import decode_token
+from geopy.geocoders import Nominatim
 
 # Initialisation de l'application Flask
 app = Flask(__name__)
@@ -29,6 +29,14 @@ class User(db.Model):
     username = db.Column(db.String(100), unique=True, nullable=False)
     password = db.Column(db.String(100), nullable=False)
     address = db.Column(db.String(255))
+
+class Driver(db.Model):
+    __tablename__ = 'drivers'
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    # Autres champs pour les conducteurs
+
 
 class Restaurant(db.Model):
     __tablename__ = 'restaurant'
@@ -69,9 +77,30 @@ class Order(db.Model):
     delivery_address = db.Column(db.String, nullable=False)
     items = db.Column(db.Text, nullable=False)  # Stocké comme JSON string
     total_price = db.Column(db.Float, nullable=False)
+    status = db.Column(db.String(50), default="pending", nullable=False)  # Nouveau champ
 
     def get_items(self):
         return json.loads(self.items)  # Convertir la chaîne JSON en liste Python
+
+class Trip(db.Model):
+    __tablename__ = 'trips'
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    driver_id = db.Column(db.Integer, db.ForeignKey('drivers.id'), nullable=True)  # Référence à la table drivers
+    start_latitude = db.Column(db.Float, nullable=False)
+    start_longitude = db.Column(db.Float, nullable=False)
+    end_latitude = db.Column(db.Float, nullable=False)
+    end_longitude = db.Column(db.Float, nullable=False)
+    status = db.Column(db.String(50), default="pending", nullable=False)
+
+    # Relations
+    user = db.relationship('User', backref=db.backref('trips', lazy=True))
+    driver = db.relationship('Driver', backref='trips')  # Relation avec le modèle Driver
+
+
+
+
 
 
 
@@ -267,12 +296,13 @@ def create_order_manual_jwt():
     if not auth_header.startswith("Bearer "):
         return jsonify({"message": "Authorization header must start with 'Bearer '"}), 401
 
-    token = auth_header.split(" ")[1]  # Extraire le jeton
+    token = auth_header.split(" ")[1]
     try:
+        # Décoder le token JWT pour obtenir les informations utilisateur
         decoded_token = decode_token(token)
-        user_id = decoded_token.get("sub")  # Récupérer l'ID utilisateur à partir du JWT
+        user_id = decoded_token.get("sub")
 
-        # Vérifier que user_id est une chaîne
+        # Vérifier si user_id est valide
         if not isinstance(user_id, str):
             return jsonify({"message": "Invalid token: 'sub' must be a string"}), 401
 
@@ -280,7 +310,40 @@ def create_order_manual_jwt():
     except Exception as e:
         return jsonify({"message": f"Token decode error: {str(e)}"}), 401
 
-    return jsonify({"message": "Request processed successfully", "user_id": user_id}), 200
+    try:
+        # Récupérer les données de la requête
+        data = request.get_json()
+        restaurant_id = data.get('restaurant_id')
+        delivery_address = data.get('delivery_address')
+        items = data.get('items')
+        total_price = data.get('total_price')
+
+        # Validation des champs
+        if not all([restaurant_id, delivery_address, items, total_price]):
+            return jsonify({"message": "All fields are required"}), 400
+
+        # Vérifier si le restaurant existe
+        restaurant = Restaurant.query.get(restaurant_id)
+        if not restaurant:
+            return jsonify({"message": "Restaurant not found"}), 404
+
+        # Créer la commande
+        new_order = Order(
+            user_id=user_id,
+            restaurant_id=restaurant_id,
+            delivery_address=delivery_address,
+            items=json.dumps(items),  # Convertir les items en JSON string
+            total_price=total_price
+        )
+        db.session.add(new_order)
+        db.session.commit()
+
+        return jsonify({"message": "Order created successfully", "order_id": new_order.id}), 201
+    except Exception as e:
+        db.session.rollback()
+        print(f"Erreur : {str(e)}")
+        return jsonify({"message": "An error occurred while creating the order", "error": str(e)}), 500
+
 
 @app.route('/debug_jwt', methods=['GET'])
 def debug_jwt():
@@ -297,68 +360,132 @@ def debug_jwt():
     except Exception as e:
         return jsonify({"message": f"Token decode error: {str(e)}"}), 401
 
+
 #Lister les Commandes d'un Utilisateur
-@app.route('/orders', methods=['GET'])
+@app.route('/orders/ongoing', methods=['GET'])
 @jwt_required()
-def list_orders():
+def list_ongoing_orders():
     current_user_id = get_jwt_identity()
-    orders = Order.query.filter_by(user_id=current_user_id).all()
 
-    order_list = [
-        {
-            "id": order.id,
-            "restaurant_id": order.restaurant_id,
-            "delivery_address": order.delivery_address,
-            "items": order.items,
-            "total_price": order.total_price,
-            "status": order.status,
-            "created_at": order.created_at,
-        }
-        for order in orders
-    ]
-    return jsonify(order_list), 200
+    try:
+        # Filtrer les commandes en fonction de l'utilisateur et du statut
+        ongoing_orders = Order.query.filter(
+            Order.user_id == current_user_id,
+            Order.status.in_(["pending", "in_progress"])
+        ).all()
 
-#Mettre à Jour l'État d'une Commande (Pour Admin ou Utilisateur)
-@app.route('/orders/<int:order_id>/status', methods=['PUT'])
+        # Construire la réponse JSON
+        orders_list = [
+            {
+                "id": order.id,
+                "restaurant_id": order.restaurant_id,
+                "delivery_address": order.delivery_address,
+                "items": order.get_items(),
+                "total_price": order.total_price,
+                "status": order.status
+            }
+            for order in ongoing_orders
+        ]
+
+        return jsonify(orders_list), 200
+    except Exception as e:
+        print(f"Erreur lors de la récupération des commandes : {str(e)}")
+        return jsonify({"message": "An error occurred while fetching ongoing orders", "error": str(e)}), 500
+@app.route('/orders/<int:order_id>', methods=['GET'])
 @jwt_required()
-def update_order_status(order_id):
+def get_order(order_id):
     current_user_id = get_jwt_identity()
-    data = request.get_json()
-    new_status = data.get('status')
 
-    if not new_status:
-        return jsonify({"message": "Status is required"}), 400
-
-    # Vérification de la commande
+    # Rechercher la commande par son ID
     order = Order.query.get(order_id)
     if not order:
         return jsonify({"message": "Order not found"}), 404
 
-    # Mise à jour de l'état de la commande
+    # Vérifier que l'utilisateur est le propriétaire
+    if order.user_id != current_user_id:
+        return jsonify({"message": "You are not authorized to view this order"}), 403
+
+    # Retourner les détails de la commande
+    return jsonify({
+        "id": order.id,
+        "restaurant_id": order.restaurant_id,
+        "delivery_address": order.delivery_address,
+        "items": json.loads(order.items),
+        "total_price": order.total_price,
+        "status": order.status
+    }), 200
+
+
+
+#Mettre à Jour l'État d'une Commande (Pour Admin ou Utilisateur)
+@app.route('/orders/<int:order_id>', methods=['PUT'])
+@jwt_required()
+def update_order(order_id):
+    current_user_id = get_jwt_identity()
+
     try:
-        order.status = new_status
+        # Récupérer les données de la requête
+        data = request.get_json()
+
+        # Récupérer la commande
+        order = Order.query.get(order_id)
+        if not order:
+            return jsonify({"message": "Order not found"}), 404
+
+        # Vérifier si l'utilisateur connecté est le propriétaire de la commande
+        if order.user_id != current_user_id:
+            return jsonify({"message": "You are not authorized to update this order"}), 403
+
+        # Mettre à jour les champs spécifiés
+        if 'delivery_address' in data:
+            order.delivery_address = data['delivery_address']
+        if 'items' in data:
+            order.items = json.dumps(data['items'])  # Convertir les items en JSON string
+        if 'total_price' in data:
+            order.total_price = data['total_price']
+        if 'status' in data:
+            order.status = data['status']
+
+        # Enregistrer les modifications
         db.session.commit()
-        return jsonify({"message": "Order status updated successfully"}), 200
+        return jsonify({"message": "Order updated successfully"}), 200
+
     except Exception as e:
         db.session.rollback()
-        return jsonify({"message": f"Error: {str(e)}"}), 500
+        return jsonify({"message": f"An error occurred while updating the order: {str(e)}"}), 500
 
 #Route pour annuler une commande
-@app.route('/orders/<int:id>/cancel', methods=['PUT'])
-def cancel_order(id):
-    order = Order.query.get(id)
+@app.route('/orders/<int:order_id>/cancel', methods=['PATCH'])
+@jwt_required()
+def cancel_order(order_id):
+    current_user_id = get_jwt_identity()
 
-    if not order:
-        return jsonify({"msg": "Order not found"}), 404
+    try:
+        # Récupérer la commande par son ID
+        order = Order.query.get(order_id)
+        if not order:
+            return jsonify({"message": "Order not found"}), 404
 
-    # Vérifie si la commande est déjà annulée
-    if order.status == 'cancelled':
-        return jsonify({"msg": "Order is already cancelled"}), 400
+        # Vérifier que l'utilisateur connecté est le propriétaire de la commande
+        if order.user_id != current_user_id:
+            return jsonify({"message": "You are not authorized to cancel this order"}), 403
 
-    # Annuler la commande
-    order.status = 'cancelled'
-    db.session.commit()  # Enregistrer les changements dans la base de données
-    return jsonify({"msg": "Order has been cancelled", "order_id": order.id}), 200
+        # Vérifier si la commande est déjà terminée ou annulée
+        if order.status in ["completed", "canceled"]:
+            return jsonify({"message": f"Order cannot be canceled as it is already {order.status}"}), 400
+
+        # Mettre à jour le statut de la commande
+        order.status = "canceled"
+
+        # Enregistrer les modifications dans la base de données
+        db.session.commit()
+
+        return jsonify({"message": "Order has been canceled successfully"}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"message": f"An error occurred while canceling the order: {str(e)}"}), 500
+
 
 #Ajoute une route pour mettre à jour l'adresse de l'utilisateur
 @app.route('/users/address', methods=['PUT'])
@@ -369,20 +496,39 @@ def update_address():
 
     latitude = data.get('latitude')
     longitude = data.get('longitude')
-    address = data.get('address')  # Adresse optionnelle générée sur le front-end
+    address = data.get('address')  # Adresse optionnelle
 
-    if not all([latitude, longitude]):
-        return jsonify({"message": "Latitude and longitude are required"}), 400
+    # Validation des coordonnées GPS
+    try:
+        latitude = float(latitude)
+        longitude = float(longitude)
+    except (TypeError, ValueError):
+        return jsonify({"message": "Latitude and longitude must be valid numbers"}), 400
 
+    # Vérification de l'utilisateur
     user = User.query.get(current_user_id)
     if not user:
         return jsonify({"message": "User not found"}), 404
+
+    # Générer l'adresse si elle n'est pas fournie
+    if not address:
+        geolocator = Nominatim(user_agent="my_app")
+        try:
+            location = geolocator.reverse((latitude, longitude))
+            address = location.address if location else "Unknown location"
+        except Exception as e:
+            return jsonify({"message": f"Failed to generate address: {str(e)}"}), 500
 
     # Mettre à jour l'adresse de l'utilisateur
     user.address = address
     try:
         db.session.commit()
-        return jsonify({"message": "Address updated successfully"}), 200
+        return jsonify({
+            "message": "Address updated successfully",
+            "latitude": latitude,
+            "longitude": longitude,
+            "address": address
+        }), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"message": f"Error: {str(e)}"}), 500
@@ -400,38 +546,154 @@ def request_trip():
     db.session.commit()
 
     return jsonify({"msg": "Trip requested", "trip_id": new_trip.id}), 201
+#cree un trajet
+@app.route('/trips', methods=['POST'])
+@jwt_required()
+def create_trip():
+    """
+    Crée un trajet pour un utilisateur authentifié. Un conducteur peut être assigné.
+    """
+    current_user_id = get_jwt_identity()  # Récupère l'ID de l'utilisateur connecté
+
+    # Récupérer les données envoyées dans la requête
+    data = request.get_json()
+
+    start_latitude = data.get('start_latitude')
+    start_longitude = data.get('start_longitude')
+    end_latitude = data.get('end_latitude')
+    end_longitude = data.get('end_longitude')
+    driver_id = data.get('driver_id')  # Ce champ est optionnel
+
+    # Vérification des coordonnées
+    if not all([start_latitude, start_longitude, end_latitude, end_longitude]):
+        return jsonify({"message": "Start and end coordinates are required"}), 400
+
+    # Créer un nouvel objet Trip
+    new_trip = Trip(
+        user_id=current_user_id,  # L'utilisateur actuel
+        start_latitude=start_latitude,
+        start_longitude=start_longitude,
+        end_latitude=end_latitude,
+        end_longitude=end_longitude,
+        driver_id=driver_id,  # Optionnel si aucun conducteur n'est assigné
+        status="pending"  # Statut initial
+    )
+
+    # Ajouter à la base de données
+    try:
+        db.session.add(new_trip)
+        db.session.commit()
+        return jsonify({
+            "message": "Trip created successfully",
+            "trip_id": new_trip.id,
+            "status": new_trip.status
+        }), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"message": f"Error creating trip: {str(e)}"}), 500
+
+
+#Lister tous les trajets disponibles
+@app.route('/trips', methods=['GET'])
+@jwt_required()
+def list_trips():
+    trips = Trip.query.all()  # Récupérer tous les trajets
+    trips_list = [
+        {
+            "id": trip.id,
+            "user_id": trip.user_id,
+            "driver_id": trip.driver_id,
+            "status": trip.status,
+            "delivery_address": trip.delivery_address
+        }
+        for trip in trips
+    ]
+    return jsonify(trips_list), 200
+
 
 
 #Route pour assigner un conducteur à un trajet
-@app.route('/assign_driver/<int:trip_id>', methods=['PUT'])
-def assign_driver(trip_id):
+@app.route('/trips/<int:trip_id>/assign_driver', methods=['PUT'])
+@jwt_required()
+def assign_driver_to_trip(trip_id):
+    current_user_id = get_jwt_identity()
+
+    # Récupérer les données du corps de la requête
     data = request.get_json()
+
+    # Debugging: Afficher le corps de la requête pour vérifier sa structure
+    print("Données reçues :", data)
+
+    # Vérifier que driver_id est bien présent dans les données
     driver_id = data.get('driver_id')
 
+    if not driver_id:
+        return jsonify({"message": "Driver ID is required"}), 400
+
+    # Vérification de l'existence du conducteur
+    driver = Driver.query.get(driver_id)
+    if not driver:
+        return jsonify({"message": "Driver not found"}), 404
+
+    # Récupérer le trajet
     trip = Trip.query.get(trip_id)
     if not trip:
-        return jsonify({"msg": "Trip not found"}), 404
+        return jsonify({"message": "Trip not found"}), 404
 
+    # Assigner le conducteur au trajet
     trip.driver_id = driver_id
-    trip.status = 'in_progress'
-    db.session.commit()
+    trip.status = "assigned"  # Marquer le trajet comme "assigné"
 
-    return jsonify({"msg": "Driver assigned", "trip_id": trip.id, "status": trip.status})
+    try:
+        db.session.commit()
+        return jsonify({"message": "Driver assigned successfully", "trip_id": trip.id, "driver_id": driver_id}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"message": f"Error assigning driver: {str(e)}"}), 500
+
 
 #Route pour mettre à jour l'état du trajet
-@app.route('/update_trip_status/<int:trip_id>', methods=['PUT'])
+@app.route('/trips/<int:trip_id>', methods=['PUT'])
+@jwt_required()
 def update_trip_status(trip_id):
-    data = request.get_json()
-    status = data.get('status')
+    """
+    Met à jour le statut d'un trajet en fonction de son ID.
+    Le statut peut être 'pending', 'in_progress', 'completed', etc.
+    """
+    current_user_id = get_jwt_identity()  # Récupère l'ID de l'utilisateur connecté
 
+    # Récupérer les données envoyées dans la requête
+    data = request.get_json()
+
+    new_status = data.get('status')  # Statut à mettre à jour (ex: 'in_progress', 'completed', etc.)
+
+    # Vérification du statut
+    if new_status not in ['pending', 'in_progress', 'completed', 'cancelled']:
+        return jsonify({"message": "Invalid status value"}), 400
+
+    # Récupérer le trajet correspondant à l'ID
     trip = Trip.query.get(trip_id)
     if not trip:
-        return jsonify({"msg": "Trip not found"}), 404
+        return jsonify({"message": "Trip not found"}), 404
 
-    trip.status = status
-    db.session.commit()
+    # Vérifier si l'utilisateur actuel est le propriétaire ou le conducteur de la commande
+    if trip.user_id != current_user_id and (trip.driver_id is not None and trip.driver_id != current_user_id):
+        return jsonify({"message": "You do not have permission to update this trip"}), 403
 
-    return jsonify({"msg": "Trip status updated", "trip_id": trip.id, "status": trip.status})
+    # Mettre à jour le statut de la commande
+    trip.status = new_status
+
+    # Sauvegarder les modifications dans la base de données
+    try:
+        db.session.commit()
+        return jsonify({
+            "message": "Trip status updated successfully",
+            "trip_id": trip.id,
+            "new_status": trip.status
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"message": f"Error updating trip status: {str(e)}"}), 500
 
 
 # Lancer l'application Flask
