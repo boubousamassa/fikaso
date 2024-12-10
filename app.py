@@ -6,6 +6,7 @@ from models import db, Trip, MenuItem , Restaurant
 import json
 from flask_jwt_extended import decode_token
 from geopy.geocoders import Nominatim
+from geopy.distance import geodesic
 
 # Initialisation de l'application Flask
 app = Flask(__name__)
@@ -488,47 +489,83 @@ def cancel_order(order_id):
 
 
 #Ajoute une route pour mettre à jour l'adresse de l'utilisateur
-@app.route('/users/address', methods=['PUT'])
+class Delivery(db.Model):
+    __tablename__ = 'deliveries'
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    departure_latitude = db.Column(db.Float, nullable=False)
+    departure_longitude = db.Column(db.Float, nullable=False)
+    arrival_latitude = db.Column(db.Float, nullable=False)
+    arrival_longitude = db.Column(db.Float, nullable=False)
+    distance = db.Column(db.Float, nullable=False)
+
+    user = db.relationship('User', backref='deliveries')
+
+    def __repr__(self):
+        return f'<Delivery {self.id}>'
+
+
+
+@app.route('/users/delivery', methods=['POST'])
 @jwt_required()
-def update_address():
+def create_delivery():
     current_user_id = get_jwt_identity()
     data = request.get_json()
 
-    latitude = data.get('latitude')
-    longitude = data.get('longitude')
-    address = data.get('address')  # Adresse optionnelle
+    departure_latitude = data.get('departure_latitude')
+    departure_longitude = data.get('departure_longitude')
+    arrival_latitude = data.get('arrival_latitude')
+    arrival_longitude = data.get('arrival_longitude')
 
     # Validation des coordonnées GPS
     try:
-        latitude = float(latitude)
-        longitude = float(longitude)
+        departure_latitude = float(departure_latitude)
+        departure_longitude = float(departure_longitude)
+        arrival_latitude = float(arrival_latitude)
+        arrival_longitude = float(arrival_longitude)
     except (TypeError, ValueError):
-        return jsonify({"message": "Latitude and longitude must be valid numbers"}), 400
+        return jsonify({"message": "Coordinates must be valid numbers"}), 400
 
     # Vérification de l'utilisateur
     user = User.query.get(current_user_id)
     if not user:
         return jsonify({"message": "User not found"}), 404
 
-    # Générer l'adresse si elle n'est pas fournie
-    if not address:
-        geolocator = Nominatim(user_agent="my_app")
-        try:
-            location = geolocator.reverse((latitude, longitude))
-            address = location.address if location else "Unknown location"
-        except Exception as e:
-            return jsonify({"message": f"Failed to generate address: {str(e)}"}), 500
+    # Calculer la distance entre les deux points
+    departure_point = (departure_latitude, departure_longitude)
+    arrival_point = (arrival_latitude, arrival_longitude)
 
-    # Mettre à jour l'adresse de l'utilisateur
-    user.address = address
     try:
+        distance = geodesic(departure_point, arrival_point).kilometers
+    except Exception as e:
+        return jsonify({"message": f"Failed to calculate distance: {str(e)}"}), 500
+
+    # Enregistrer la livraison
+    delivery = Delivery(
+        user_id=current_user_id,
+        departure_latitude=departure_latitude,
+        departure_longitude=departure_longitude,
+        arrival_latitude=arrival_latitude,
+        arrival_longitude=arrival_longitude,
+        distance=distance
+    )
+
+    try:
+        db.session.add(delivery)
         db.session.commit()
         return jsonify({
-            "message": "Address updated successfully",
-            "latitude": latitude,
-            "longitude": longitude,
-            "address": address
-        }), 200
+            "message": "Delivery created successfully",
+            "distance": distance,
+            "departure": {
+                "latitude": departure_latitude,
+                "longitude": departure_longitude
+            },
+            "arrival": {
+                "latitude": arrival_latitude,
+                "longitude": arrival_longitude
+            }
+        }), 201
     except Exception as e:
         db.session.rollback()
         return jsonify({"message": f"Error: {str(e)}"}), 500
@@ -546,6 +583,7 @@ def request_trip():
     db.session.commit()
 
     return jsonify({"msg": "Trip requested", "trip_id": new_trip.id}), 201
+
 #cree un trajet
 @app.route('/trips', methods=['POST'])
 @jwt_required()
